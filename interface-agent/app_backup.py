@@ -1,5 +1,4 @@
 ﻿from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 import redis
 import json
 import os
@@ -8,15 +7,6 @@ import httpx
 from pydantic import BaseModel
 
 app = FastAPI(title="Interface Agent IA")
-
-# Configuration CORS (pour que Swagger fonctionne)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
@@ -53,7 +43,9 @@ def send_command(cmd: Command):
     }
 
 def parse_simple(text):
+    """Parsing simple et rapide (fallback)"""
     text = text.lower()
+    
     if "lampe" in text:
         objet = "lampe"
     elif "prise" in text:
@@ -62,6 +54,7 @@ def parse_simple(text):
         objet = "thermostat"
     else:
         return None, None, None
+    
     if "allume" in text:
         action = "on"
     elif "eteins" in text or "éteins" in text:
@@ -78,50 +71,94 @@ def parse_simple(text):
         action = "get_state"
     else:
         action = "get_state"
+    
     return objet, action, None
 
 def ask_ollama(prompt):
+    """Interroge Ollama avec timeout plus long"""
     try:
         response = httpx.post(
             "http://host.docker.internal:11434/api/generate",
             json={
                 "model": "qwen2.5:1.5b-instruct",
-                "prompt": f"""Convertit cette demande en JSON. Format: {{"objet": "lampe|prise|thermostat", "action": "on|off|get_state|set_temp", "valeur": (nombre)}} Demande: {prompt} JSON:""",
+                "prompt": f"""Convertit cette demande domotique en JSON.
+Format: {{"objet": "lampe|prise|thermostat", "action": "on|off|get_state|set_temp", "valeur": (nombre si set_temp)}}
+Demande: {prompt}
+JSON:""",
                 "stream": False,
-                "options": {"num_predict": 50, "temperature": 0}
+                "options": {
+                    "num_predict": 50,
+                    "temperature": 0
+                }
             },
             timeout=30.0
         )
         result = response.json()
+        
         import re
         json_match = re.search(r'\{.*\}', result["response"], re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
         return None
-    except:
+    except Exception as e:
+        print(f"Ollama error: {e}")
         return None
 
 @app.post("/command_ia")
 async def send_command_ia(cmd: TextCommand):
+    """Commande en langage naturel (avec IA)"""
     trace_id = str(uuid.uuid4())
+    
+    # Essayer Ollama d'abord (30 secondes max)
     parsed = ask_ollama(cmd.texte)
+    
+    # Fallback sur parsing simple si Ollama échoue
     if not parsed:
         objet, action, valeur = parse_simple(cmd.texte)
-        if not objet or not action:
-            return {"status": "error", "message": f"Je n'ai pas compris: {cmd.texte}"}
-    else:
-        objet = parsed.get("objet")
-        action = parsed.get("action")
-        valeur = parsed.get("valeur")
+        if objet and action:
+            message = {
+                "objet": objet,
+                "action": action,
+                "valeur": valeur,
+                "trace_id": trace_id
+            }
+            r.xadd(TOPIC, {"command": json.dumps(message)})
+            return {
+                "status": "command_sent",
+                "trace_id": trace_id,
+                "message": f"✅ (mode simple) Commande: {action} sur {objet}",
+                "commande_parsee": message,
+                "mode": "fallback"
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"Je n'ai pas compris: {cmd.texte}",
+                "suggestion": "Exemples: 'allume la lampe', 'éteins la prise', 'état du thermostat'"
+            }
+    
+    objet = parsed.get("objet")
+    action = parsed.get("action")
+    valeur = parsed.get("valeur")
+    
     if not objet or not action:
         return {"status": "error", "message": "Impossible de comprendre la commande"}
-    message = {"objet": objet, "action": action, "valeur": valeur, "trace_id": trace_id}
+    
+    message = {
+        "objet": objet,
+        "action": action,
+        "valeur": valeur,
+        "trace_id": trace_id
+    }
+    
     r.xadd(TOPIC, {"command": json.dumps(message)})
+    
     return {
         "status": "command_sent",
         "trace_id": trace_id,
-        "message": f"✅ Commande: {action} sur {objet}" + (f" à {valeur}°C" if valeur else ""),
-        "mode": "fallback" if not parsed else "ollama"
+        "message": f"✅ IA: {action} sur {objet}" + (f" à {valeur}°C" if valeur else ""),
+        "commande_parsee": message,
+        "mode": "ollama"
     }
 
 @app.get("/response/{trace_id}")
@@ -137,6 +174,9 @@ def get_response(trace_id: str):
 async def ollama_status():
     try:
         response = httpx.get("http://host.docker.internal:11434/api/tags", timeout=5.0)
-        return {"status": "connected", "models": [m["name"] for m in response.json().get("models", [])]}
+        return {
+            "status": "connected",
+            "models": [m["name"] for m in response.json().get("models", [])]
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
