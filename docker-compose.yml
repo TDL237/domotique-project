@@ -1,0 +1,54 @@
+﻿services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  lamp-agent:
+    build: ./lamp-agent
+    ports:
+      - "8001:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  prise-agent:
+    build: ./prise-agent
+    ports:
+      - "8002:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  thermostat-agent:
+    build: ./thermostat-agent
+    ports:
+      - "8003:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  coordinateur:
+    build: ./coordinateur
+    depends_on:
+      redis:
+        condition: service_healthy
+      lamp-agent:
+        condition: service_started
+      prise-agent:
+        condition: service_started
+      thermostat-agent:
+        condition: service_started
+
+  interface-agent:
+    build: ./interface-agent
+    ports:
+      - "8005:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
